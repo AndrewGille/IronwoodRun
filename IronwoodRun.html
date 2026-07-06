@@ -1,0 +1,919 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Ironwood Run — Race to the Cabin</title>
+<style>
+  :root{
+    --snow:#eef4fb; --ink:#1d2a3a; --sun:#ffd94a; --sky1:#8fd0ff; --sky2:#e8f6ff;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{height:100%;background:#0e1a28;font-family:"Trebuchet MS","Comic Sans MS",sans-serif;overflow:hidden}
+  #wrap{position:relative;width:100vw;height:100vh;display:flex;align-items:center;justify-content:center}
+  canvas{background:#8fd0ff;border-radius:10px;box-shadow:0 18px 60px rgba(0,0,0,.55);max-width:100%;max-height:100%}
+  #hint{position:absolute;bottom:10px;left:50%;transform:translateX(-50%);color:#9fb8d4;font-size:13px;letter-spacing:.06em;opacity:.85;pointer-events:none}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="game" width="960" height="540"></canvas>
+  <div id="hint">SPACE = jump &nbsp;·&nbsp; B = boost &nbsp;·&nbsp; ENTER = start / confirm</div>
+</div>
+<script>
+"use strict";
+/* ============================================================
+   IRONWOOD RUN — side-scrolling parallax snowmobile racer
+   Layers: mountains (far) -> pine forest (mid) -> game (front)
+   ============================================================ */
+const cv = document.getElementById("game");
+const cx = cv.getContext("2d");
+const W = cv.width, H = cv.height;
+const GROUND_Y = H - 92;               // snow line the sled rides on
+
+/* ---------- utils ---------- */
+const clamp=(v,a,b)=>v<a?a:v>b?b:v;
+const lerp=(a,b,t)=>a+(b-a)*t;
+function mulberry(seed){return function(){seed|=0;seed=seed+0x6D2B79F5|0;let t=Math.imul(seed^seed>>>15,1|seed);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;}}
+function rr(rand,a,b){return a+rand()*(b-a);}
+
+/* ---------- game state ---------- */
+const ST={TITLE:0,PLAY:1,LEVELDONE:2,GAMEOVER:3,WIN:4,INITIALS:5,FAME:6};
+let state=ST.TITLE;
+let runSeed=(Math.random()*1e9)|0;
+
+const MAX_LEVEL=5;
+let level=1, score=0, timer=30, stateClock=0, pendingFameRank=-1;
+
+/* in-memory hall of fame (session) */
+let hallOfFame=[{n:"SKI",s:4200},{n:"DOO",s:3100},{n:"YEL",s:2300},{n:"SNW",s:1500},{n:"CAB",s:800}];
+let initials=["A","A","A"], initialSlot=0;
+
+/* ---------- player ---------- */
+const player={
+  x:180, y:GROUND_Y, vy:0, grounded:true,
+  speed:0, baseSpeed:300, boostSpeed:250,
+  boosting:0, boostFuel:8, maxFuel:8,
+  stun:0, splash:0,
+  jumpStartX:0, airFromRamp:false, bestAir:0,
+  trackPhase:0, lean:0
+};
+const GRAV=1400, JUMP_V=-620;
+
+/* ---------- world ---------- */
+let camX=0, levelLen=0, obstacles=[], ramps=[], pickups=[], airPopups=[], flakes=[];
+let shake=0, cabinX=0;
+
+for(let i=0;i<90;i++)flakes.push({x:Math.random()*W,y:Math.random()*H,r:1+Math.random()*2.4,s:14+Math.random()*40,drift:Math.random()*2-1});
+
+/* ---------- level generation (procedural, seeded) ---------- */
+function buildLevel(n){
+  const rand=mulberry(runSeed+n*7919);
+  obstacles=[]; ramps=[]; pickups=[]; airPopups=[];
+  player.baseSpeed=300+(n-1)*28;                 // faster each level
+  player.boostSpeed=250+(n-1)*15;
+  player.maxFuel=Math.max(4,8-(n-1));            // less boost each level
+  player.boostFuel=player.maxFuel;
+  player.x=180; player.y=GROUND_Y; player.vy=0; player.grounded=true;
+  player.speed=player.baseSpeed; player.boosting=0; player.stun=0; player.splash=0; player.bestAir=0;
+  camX=0; timer=30;
+  // sized so base speed alone takes a hair over 30s; boosting brings it under
+  levelLen=player.baseSpeed*(33-(n-1)*0.5);
+  cabinX=levelLen;
+
+  const types=["deer","skunk","bear","rabbit","stump","water"];
+  let x=900;
+  const gapMin=Math.max(340,620-n*55), gapMax=Math.max(560,950-n*70);
+  while(x<levelLen-700){
+    x+=rr(rand,gapMin,gapMax);
+    if(rand()<0.26){                              // a jump ramp
+      ramps.push({x:x,w:150,h:64+rr(rand,0,20)});
+      x+=430;                                     // clear landing zone
+    }else if(rand()<0.05+n*0.012){                // rare yeti!
+      obstacles.push({x:x,type:"yeti",hit:false});
+      x+=520;                                     // room to land the throw
+    }else{
+      const t=types[(rand()*types.length)|0];
+      // bears rarer early, more common later
+      const type=(t==="bear"&&rand()>0.25+n*0.13)?"stump":t;
+      obstacles.push({x:x,type:type,hit:false});
+    }
+    if(rand()<0.20)pickups.push({x:x+rr(rand,180,320),taken:false}); // random boost can
+  }
+}
+
+/* ---------- input ---------- */
+const keys={};
+addEventListener("keydown",e=>{
+  if(["Space","ArrowUp","ArrowDown","KeyB"].includes(e.code))e.preventDefault();
+  if(keys[e.code])return; keys[e.code]=true;
+  handleKey(e.code,e.key);
+});
+addEventListener("keyup",e=>keys[e.code]=false);
+
+function handleKey(code,key){
+  if(state===ST.TITLE){
+    if(code==="Enter"||code==="Space"){startRun();}
+    if(code==="KeyH"){state=ST.FAME;}
+  }
+  else if(state===ST.PLAY){
+    if(code==="Space"&&player.grounded&&player.stun<=0){
+      player.vy=JUMP_V; player.grounded=false; player.airFromRamp=false; player.jumpStartX=player.x+camX;
+    }
+  }
+  else if(state===ST.LEVELDONE){
+    if(code==="Enter"||code==="Space")nextLevel();
+  }
+  else if(state===ST.GAMEOVER||state===ST.WIN){
+    if(code==="Enter"||code==="Space"){
+      const rank=fameRank(score);
+      if(rank>=0){pendingFameRank=rank;initials=["A","A","A"];initialSlot=0;state=ST.INITIALS;}
+      else state=ST.FAME;
+    }
+  }
+  else if(state===ST.INITIALS){
+    if(/^[a-zA-Z0-9]$/.test(key)){initials[initialSlot]=key.toUpperCase();initialSlot=Math.min(2,initialSlot+1);}
+    else if(code==="Backspace"||code==="ArrowLeft"){initialSlot=Math.max(0,initialSlot-1);}
+    else if(code==="ArrowRight"){initialSlot=Math.min(2,initialSlot+1);}
+    else if(code==="ArrowUp"||code==="ArrowDown"){
+      const A="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+      let i=A.indexOf(initials[initialSlot]); i=(i+(code==="ArrowUp"?1:A.length-1))%A.length;
+      initials[initialSlot]=A[i];
+    }
+    else if(code==="Enter"){
+      hallOfFame.splice(pendingFameRank,0,{n:initials.join(""),s:score});
+      hallOfFame=hallOfFame.slice(0,5);
+      state=ST.FAME;
+    }
+  }
+  else if(state===ST.FAME){
+    if(code==="Enter"||code==="Space"){pendingFameRank=-1;state=ST.TITLE;}
+  }
+}
+function fameRank(s){for(let i=0;i<hallOfFame.length;i++)if(s>hallOfFame[i].s)return i;return hallOfFame.length<5?hallOfFame.length:-1;}
+function startRun(){runSeed=(Math.random()*1e9)|0;level=1;score=0;buildLevel(1);state=ST.PLAY;}
+function nextLevel(){level++;buildLevel(level);state=ST.PLAY;}
+
+/* ---------- update ---------- */
+let last=performance.now();
+function tick(now){
+  const dt=Math.min(0.033,(now-last)/1000); last=now;
+  update(dt); draw(now/1000);
+  requestAnimationFrame(tick);
+}
+function update(dt){
+  // snow always falls
+  for(const f of flakes){f.y+=f.s*dt;f.x+=f.drift*18*dt-(state===ST.PLAY?player.speed*0.10*dt:6*dt);
+    if(f.y>H){f.y=-4;f.x=Math.random()*W;} if(f.x<-4)f.x=W+4;}
+  shake=Math.max(0,shake-dt*3);
+  stateClock+=dt;
+  if(state!==ST.PLAY)return;
+
+  timer-=dt;
+  if(timer<=0){timer=0;state=ST.GAMEOVER;stateClock=0;return;}
+
+  // speed — boost runs while B is held and fuel remains
+  player.stun=Math.max(0,player.stun-dt);
+  player.splash=Math.max(0,player.splash-dt);
+  const boostActive=keys["KeyB"]&&player.boostFuel>0&&player.stun<=0;
+  if(boostActive)player.boostFuel=Math.max(0,player.boostFuel-dt);
+  player.boosting=boostActive?1:0;               // drives the flame effect
+  let target=player.baseSpeed+(boostActive?player.boostSpeed:0);
+  if(player.stun>0)target*=0.35;
+  if(player.splash>0)target*=0.55;
+  player.speed=lerp(player.speed,target,clamp(dt*4,0,1));
+
+  camX+=player.speed*dt;
+  player.trackPhase+=player.speed*dt*0.06;
+
+  // vertical physics
+  if(!player.grounded){
+    player.vy+=GRAV*dt;
+    player.y+=player.vy*dt;
+    player.lean=lerp(player.lean,clamp(-player.vy/900,-0.5,0.55),dt*6);
+    if(player.y>=GROUND_Y){
+      player.y=GROUND_Y;player.grounded=true;player.lean=0;
+      const dist=Math.round((player.x+camX-player.jumpStartX)/10);
+      if(player.airFromRamp&&dist>4){
+        const pts=dist*2;
+        score+=pts; player.bestAir=Math.max(player.bestAir,dist);
+        airPopups.push({x:player.x,y:player.y-90,t:1.4,txt:dist+" ft!  +"+pts});
+      }
+    }
+  }else{
+    player.lean=lerp(player.lean,0,dt*8);
+  }
+
+  const worldX=player.x+camX;
+
+  // ramps: launch when riding across one
+  for(const r of ramps){
+    const rx=r.x-camX;
+    if(player.grounded&&worldX>r.x&&worldX<r.x+r.w+30){
+      // riding up ramp surface
+      const t=clamp((worldX-r.x)/r.w,0,1);
+      player.y=GROUND_Y-r.h*t;
+      if(t>=1){ // takeoff
+        player.grounded=false;
+        player.airFromRamp=true;
+        player.jumpStartX=worldX;
+        player.vy=-clamp(player.speed*1.25,520,980);
+      }
+    }
+  }
+
+  // obstacles (hitboxes are forgiving — smaller than the artwork)
+  for(const o of obstacles){
+    if(o.hit)continue;
+    if(o.type==="yeti"){
+      const px=worldX, sledFront=px+40, sledBack=px-44;
+      if(sledFront>o.x-34&&sledBack<o.x+34&&GROUND_Y-player.y<86){
+        o.hit=true; o.threw=1;                    // grabbed! super throw
+        player.grounded=false; player.airFromRamp=true;
+        player.jumpStartX=worldX; player.vy=-1050;
+        player.speed=Math.min(player.speed*1.25+120,900);
+        shake=1.2;
+        airPopups.push({x:player.x,y:player.y-130,t:1.6,txt:"YETI THROW!"});
+      }
+      continue;
+    }
+    const ow=(o.type==="bear")?54:(o.type==="water")?96:(o.type==="deer")?42:32;
+    const oh=(o.type==="bear")?58:(o.type==="deer")?52:(o.type==="water")?10:(o.type==="stump")?32:24;
+    const px=worldX, sledFront=px+40, sledBack=px-44;
+    if(sledFront>o.x-ow/2&&sledBack<o.x+ow/2){
+      const clearance=GROUND_Y-player.y;
+      if(clearance<oh-6){
+        o.hit=true;
+        if(o.type==="water"){player.splash=1.1;}
+        else{player.stun=0.8;shake=1;}
+        player.speed*=0.4;
+      }
+    }
+  }
+
+  // boost-can pickups (grab as you pass, ground or air)
+  for(const p of pickups){
+    if(p.taken)continue;
+    if(Math.abs(worldX-p.x)<44&&GROUND_Y-player.y<110){
+      p.taken=true;
+      player.boostFuel=Math.min(player.maxFuel,player.boostFuel+2);
+      airPopups.push({x:player.x,y:player.y-100,t:1.2,txt:"+BOOST"});
+    }
+  }
+
+  // popups
+  for(const p of airPopups){p.t-=dt;p.y-=26*dt;}
+  airPopups=airPopups.filter(p=>p.t>0);
+
+  // reach the cabin
+  if(worldX>=cabinX-60){
+    const bonus=Math.round(timer*50);
+    score+=bonus+level*100;
+    stateClock=0;
+    state=(level>=MAX_LEVEL)?ST.WIN:ST.LEVELDONE;
+  }
+}
+
+/* ============================================================
+   DRAWING — rendered-cartoon style: soft gradients + ink outlines
+   ============================================================ */
+const INK="#233247";
+function o(w){cx.lineWidth=w;cx.strokeStyle=INK;cx.lineJoin="round";cx.lineCap="round";}
+
+function draw(t){
+  cx.save();
+  if(shake>0)cx.translate((Math.random()-0.5)*shake*8,(Math.random()-0.5)*shake*8);
+
+  drawSky(t);
+  drawMountains();     // far parallax
+  drawForest(t);       // mid parallax
+  drawGround(t);       // foreground game layer
+  if(state===ST.PLAY||state===ST.LEVELDONE||state===ST.GAMEOVER||state===ST.WIN){
+    drawRamps(); drawCabin(); drawPickups(t); drawObstacles(t); drawSled(t); drawPopups(); drawHUD();
+  }
+  drawSnowfall();
+  drawOverlays(t);
+  cx.restore();
+}
+
+/* ----- sky ----- */
+function drawSky(t){
+  const g=cx.createLinearGradient(0,0,0,H);
+  g.addColorStop(0,"#6fb7f2");g.addColorStop(0.55,"#aBd8f8");g.addColorStop(1,"#e9f5ff");
+  cx.fillStyle=g;cx.fillRect(0,0,W,H);
+  // cartoon sun
+  cx.save();cx.translate(W-140,86);
+  cx.fillStyle="#ffe680";cx.beginPath();cx.arc(0,0,46,0,7);cx.fill();
+  cx.fillStyle="#ffd94a";cx.beginPath();cx.arc(0,0,36,0,7);cx.fill();
+  cx.restore();
+  // puffy clouds drift with slight parallax
+  const cxx=(camX*0.05)%(W+400);
+  for(let i=0;i<3;i++){
+    const x=((i*430-cxx)%(W+400)+W+400)%(W+400)-200;
+    drawCloud(x,70+i*44,1-(i*0.18));
+  }
+}
+function drawCloud(x,y,s){
+  cx.save();cx.translate(x,y);cx.scale(s,s);
+  cx.fillStyle="rgba(255,255,255,.92)";
+  cx.beginPath();
+  cx.arc(0,0,26,0,7);cx.arc(28,-8,32,0,7);cx.arc(60,2,24,0,7);cx.arc(30,12,30,0,7);
+  cx.fill();cx.restore();
+}
+
+/* ----- far layer: mountains ----- */
+function drawMountains(){
+  const px=camX*0.15, base=H-160;
+  cx.save();
+  const peaks=[[0,240,"#7f9fc9"],[1,300,"#93b2d8"]];
+  for(const[row,hgt,col]of peaks){
+    cx.fillStyle=col;
+    cx.beginPath();cx.moveTo(0,H);
+    const period=520+row*140, off=px*(1+row*0.35);
+    for(let x=-period;x<=W+period;x+=8){
+      const k=(x+off)/period;
+      const y=base-Math.abs(Math.sin(k*Math.PI))*(hgt*(0.7+0.3*Math.sin(k*2.7)))+row*70;
+      cx.lineTo(x,y);
+    }
+    cx.lineTo(W,H);cx.closePath();cx.fill();
+  }
+  // hand-drawn cap highlights
+  cx.fillStyle="rgba(255,255,255,.75)";
+  const period=520,off=px;
+  for(let x=-period;x<=W+period;x+=period){
+    const cxp=x+period/2-((off%period));
+    cx.beginPath();
+    cx.moveTo(cxp,base-235);
+    cx.lineTo(cxp+66,base-140);cx.lineTo(cxp+34,base-150);cx.lineTo(cxp+12,base-128);
+    cx.lineTo(cxp-14,base-152);cx.lineTo(cxp-46,base-138);
+    cx.closePath();cx.fill();
+  }
+  cx.restore();
+}
+
+/* ----- mid layer: pine trees ----- */
+function drawForest(){
+  const px=camX*0.4, base=GROUND_Y-8;
+  cx.fillStyle="#cfe4f4";                       // haze bank behind trees
+  cx.fillRect(0,base-120,W,140);
+  const spacing=150;
+  for(let i=-1;i<W/spacing+2;i++){
+    const wx=Math.floor((px)/spacing)+i;
+    const rand=mulberry(wx*911);
+    const x=wx*spacing-px+rr(rand,-30,30);
+    drawPine(x,base+6,0.75+rand()*0.5,true);
+  }
+}
+function drawPine(x,y,s,mid){
+  cx.save();cx.translate(x,y);cx.scale(s,s);
+  cx.fillStyle=mid?"#4d7d6d":"#2f6a55";
+  cx.strokeStyle=mid?"rgba(35,50,71,.35)":INK;cx.lineWidth=3;
+  cx.fillStyle="#6b4a32";cx.fillRect(-6,-16,12,18);
+  const layers=[[46,0],[38,-34],[28,-64]];
+  for(const[wd,oy]of layers){
+    cx.fillStyle=mid?"#5a8f7c":"#37725d";
+    cx.beginPath();cx.moveTo(-wd,oy-8);cx.lineTo(0,oy-56);cx.lineTo(wd,oy-8);cx.closePath();
+    cx.fill();if(!mid)cx.stroke();
+    cx.fillStyle="rgba(255,255,255,.85)";      // snow on boughs
+    cx.beginPath();cx.moveTo(-wd*0.6,oy-26);cx.quadraticCurveTo(0,oy-44,wd*0.6,oy-26);
+    cx.quadraticCurveTo(0,oy-30,-wd*0.6,oy-26);cx.fill();
+  }
+  cx.restore();
+}
+
+/* ----- foreground snow ----- */
+function drawGround(t){
+  const g=cx.createLinearGradient(0,GROUND_Y-20,0,H);
+  g.addColorStop(0,"#ffffff");g.addColorStop(1,"#cddff2");
+  cx.fillStyle=g;cx.fillRect(0,GROUND_Y-14,W,H-GROUND_Y+14);
+  // rolling drift line
+  cx.beginPath();cx.moveTo(0,GROUND_Y-6);
+  for(let x=0;x<=W;x+=20){
+    cx.lineTo(x,GROUND_Y-6+Math.sin((x+camX)*0.02)*5);
+  }
+  cx.lineTo(W,H);cx.lineTo(0,H);cx.closePath();
+  cx.fillStyle="#ffffff";cx.fill();
+  // sparkles
+  cx.fillStyle="rgba(160,195,235,.5)";
+  for(let i=0;i<26;i++){
+    const x=(i*173-camX*1)%W;const xx=(x+W)%W;
+    cx.fillRect(xx,GROUND_Y+14+(i*37)%60,3,3);
+  }
+}
+
+/* ----- ramps ----- */
+function drawRamps(){
+  for(const r of ramps){
+    const x=r.x-camX;if(x<-260||x>W+60)continue;
+    cx.save();cx.translate(x,GROUND_Y+4);
+    // packed-snow kicker
+    const g=cx.createLinearGradient(0,-r.h,0,4);
+    g.addColorStop(0,"#ffffff");g.addColorStop(1,"#bcd4ec");
+    cx.fillStyle=g;o(4);
+    cx.beginPath();cx.moveTo(0,2);cx.quadraticCurveTo(r.w*0.55,2,r.w,-r.h);
+    cx.lineTo(r.w,2);cx.closePath();cx.fill();cx.stroke();
+    // stripes
+    cx.strokeStyle="#f2b30c";cx.lineWidth=5;
+    cx.beginPath();cx.moveTo(6,0);cx.quadraticCurveTo(r.w*0.55,0,r.w-3,-r.h+6);cx.stroke();
+    cx.restore();
+  }
+}
+
+/* ----- cabin ----- */
+function drawCabin(){
+  const x=cabinX-camX;if(x>W+300)return;
+  cx.save();cx.translate(x,GROUND_Y+4);
+  o(4);
+  // logs
+  cx.fillStyle="#a5683c";cx.fillRect(-10,-96,190,96);cx.strokeRect(-10,-96,190,96);
+  cx.strokeStyle="rgba(35,50,71,.35)";cx.lineWidth=2;
+  for(let i=1;i<6;i++){cx.beginPath();cx.moveTo(-10,-96+i*16);cx.lineTo(180,-96+i*16);cx.stroke();}
+  // roof + snow
+  o(4);cx.fillStyle="#7c4a26";
+  cx.beginPath();cx.moveTo(-30,-92);cx.lineTo(85,-150);cx.lineTo(200,-92);cx.closePath();cx.fill();cx.stroke();
+  cx.fillStyle="#ffffff";
+  cx.beginPath();cx.moveTo(-26,-96);cx.lineTo(85,-152);cx.lineTo(196,-96);
+  cx.quadraticCurveTo(85,-132,-26,-96);cx.fill();
+  // door + warm window
+  cx.fillStyle="#5d3a1e";cx.fillRect(24,-58,36,58);cx.strokeRect(24,-58,36,58);
+  cx.fillStyle="#ffd94a";cx.fillRect(96,-66,42,34);cx.strokeRect(96,-66,42,34);
+  cx.strokeStyle=INK;cx.beginPath();cx.moveTo(117,-66);cx.lineTo(117,-32);cx.moveTo(96,-49);cx.lineTo(138,-49);cx.stroke();
+  // chimney smoke
+  cx.fillStyle="#8a5a33";cx.fillRect(130,-146,22,40);cx.strokeRect(130,-146,22,40);
+  cx.fillStyle="rgba(255,255,255,.8)";
+  for(let i=0;i<3;i++){cx.beginPath();cx.arc(141+i*8,-158-i*20,10+i*4,0,7);cx.fill();}
+  // FINISH banner
+  cx.fillStyle="#e74c3c";cx.fillRect(-70,-120,54,26);cx.strokeStyle=INK;cx.lineWidth=3;cx.strokeRect(-70,-120,54,26);
+  cx.fillStyle="#fff";cx.font="bold 13px Trebuchet MS";cx.textAlign="center";cx.fillText("FINISH",-43,-102);
+  cx.strokeStyle=INK;cx.beginPath();cx.moveTo(-70,-94);cx.lineTo(-70,4);cx.stroke();
+  cx.restore();
+}
+
+/* ----- obstacles ----- */
+function drawObstacles(t){
+  for(const ob of obstacles){
+    const x=ob.x-camX;if(x<-160||x>W+160)continue;
+    cx.save();cx.translate(x,GROUND_Y+4);
+    if(ob.hit&&ob.type!=="yeti")cx.globalAlpha=0.45;
+    switch(ob.type){
+      case "deer":drawDeer(t);break;
+      case "skunk":drawSkunk(t);break;
+      case "bear":drawBear(t);break;
+      case "rabbit":drawRabbit(t);break;
+      case "stump":drawStump();break;
+      case "water":drawWater(t);break;
+      case "yeti":drawYeti(t,ob);break;
+    }
+    cx.restore();
+  }
+}
+function drawYeti(t,ob){
+  o(4);
+  const threw=!!ob.hit;
+  const sway=threw?0:Math.sin(t*2.4)*3;
+  // shaggy body
+  cx.fillStyle="#e9f1f7";
+  cx.beginPath();
+  cx.moveTo(-30,0);
+  cx.quadraticCurveTo(-40,-50+sway,-24,-84+sway);
+  cx.quadraticCurveTo(0,-104+sway,24,-84+sway);
+  cx.quadraticCurveTo(40,-50+sway,30,0);
+  // shaggy hem
+  for(let i=30;i>=-30;i-=10)cx.quadraticCurveTo(i-5,8,i-10,0);
+  cx.closePath();cx.fill();cx.stroke();
+  // belly shading
+  cx.fillStyle="#cfe0ee";
+  cx.beginPath();cx.ellipse(0,-38+sway,18,26,0,0,7);cx.fill();
+  // arms: raised & wiggling before the grab, triumphant after the throw
+  const la=-96+(threw?-8:Math.sin(t*6)*5), ra=-96+(threw?-8:Math.cos(t*6)*5);
+  cx.strokeStyle=INK;cx.lineWidth=17;cx.lineCap="round";
+  cx.beginPath();cx.moveTo(-24,-74+sway);cx.lineTo(-46,la);cx.stroke();
+  cx.beginPath();cx.moveTo(24,-74+sway);cx.lineTo(46,ra);cx.stroke();
+  cx.strokeStyle="#e9f1f7";cx.lineWidth=12;
+  cx.beginPath();cx.moveTo(-24,-74+sway);cx.lineTo(-46,la);cx.stroke();
+  cx.beginPath();cx.moveTo(24,-74+sway);cx.lineTo(46,ra);cx.stroke();
+  // face patch
+  cx.fillStyle="#8fa9c0";
+  cx.beginPath();cx.ellipse(0,-84+sway,15,12,0,0,7);cx.fill();
+  // eyes + fangs
+  cx.fillStyle="#fff";cx.beginPath();cx.arc(-6,-88+sway,4,0,7);cx.arc(6,-88+sway,4,0,7);cx.fill();
+  cx.fillStyle=INK;cx.beginPath();cx.arc(-5,-88+sway,1.8,0,7);cx.arc(7,-88+sway,1.8,0,7);cx.fill();
+  cx.fillStyle="#fff";
+  cx.beginPath();cx.moveTo(-6,-77+sway);cx.lineTo(-3,-71+sway);cx.lineTo(0,-77+sway);cx.closePath();cx.fill();
+  cx.beginPath();cx.moveTo(2,-77+sway);cx.lineTo(5,-71+sway);cx.lineTo(8,-77+sway);cx.closePath();cx.fill();
+  cx.strokeStyle=INK;cx.lineWidth=2.5;
+  cx.beginPath();cx.moveTo(-9,-78+sway);cx.lineTo(11,-78+sway);cx.stroke();
+}
+function drawPickups(t){
+  for(const p of pickups){
+    if(p.taken)continue;
+    const x=p.x-camX;if(x<-60||x>W+60)continue;
+    const bob=Math.sin(t*3+p.x)*6;
+    cx.save();cx.translate(x,GROUND_Y-52+bob);
+    // glow
+    cx.fillStyle="rgba(255,148,48,.25)";
+    cx.beginPath();cx.arc(0,0,26+Math.sin(t*5)*3,0,7);cx.fill();
+    // canister
+    o(3);cx.fillStyle="#ff9430";
+    cx.beginPath();cx.roundRect(-13,-16,26,32,6);cx.fill();cx.stroke();
+    cx.fillStyle="#e0761a";cx.fillRect(-13,-16,26,7);
+    // lightning bolt
+    cx.fillStyle="#fff";
+    cx.beginPath();cx.moveTo(3,-10);cx.lineTo(-6,2);cx.lineTo(-1,2);cx.lineTo(-3,12);cx.lineTo(7,-1);cx.lineTo(1,-1);
+    cx.closePath();cx.fill();
+    cx.restore();
+  }
+}
+function drawDeer(t){
+  o(3.5);cx.fillStyle="#b57b46";
+  const bob=Math.sin(t*6)*2;
+  // legs
+  cx.strokeStyle=INK;cx.lineWidth=5;
+  cx.beginPath();cx.moveTo(-16,-34);cx.lineTo(-18,0);cx.moveTo(14,-34);cx.lineTo(16,0);cx.stroke();
+  // body
+  o(3.5);cx.beginPath();cx.ellipse(0,-42+bob,26,15,0,0,7);cx.fill();cx.stroke();
+  // neck+head
+  cx.beginPath();cx.moveTo(18,-48+bob);cx.lineTo(30,-70+bob);cx.stroke();
+  cx.fillStyle="#b57b46";cx.beginPath();cx.ellipse(33,-72+bob,10,7,0.4,0,7);cx.fill();cx.stroke();
+  // antlers
+  cx.beginPath();cx.moveTo(30,-78+bob);cx.lineTo(24,-92+bob);cx.moveTo(27,-85+bob);cx.lineTo(20,-88+bob);
+  cx.moveTo(34,-79+bob);cx.lineTo(38,-93+bob);cx.stroke();
+  // tail + eye
+  cx.fillStyle="#fff";cx.beginPath();cx.arc(-25,-46+bob,5,0,7);cx.fill();
+  cx.fillStyle=INK;cx.beginPath();cx.arc(36,-74+bob,1.8,0,7);cx.fill();
+}
+function drawSkunk(t){
+  o(3.5);const wig=Math.sin(t*8)*3;
+  cx.fillStyle="#26303f";
+  cx.beginPath();cx.ellipse(0,-14,22,12,0,0,7);cx.fill();cx.stroke();
+  // tail plume
+  cx.fillStyle="#26303f";
+  cx.beginPath();cx.moveTo(-16,-18);cx.quadraticCurveTo(-38,-46+wig,-22,-52+wig);
+  cx.quadraticCurveTo(-6,-52+wig,-10,-22);cx.closePath();cx.fill();cx.stroke();
+  // white stripe
+  cx.fillStyle="#fff";
+  cx.beginPath();cx.moveTo(-14,-22);cx.quadraticCurveTo(-30,-44+wig,-20,-48+wig);
+  cx.quadraticCurveTo(-12,-46+wig,-8,-24);cx.closePath();cx.fill();
+  cx.beginPath();cx.ellipse(2,-22,16,4,0,0,7);cx.fill();
+  // head
+  cx.fillStyle="#26303f";cx.beginPath();cx.arc(20,-14,8,0,7);cx.fill();cx.stroke();
+  cx.fillStyle="#fff";cx.beginPath();cx.arc(24,-16,1.6,0,7);cx.fill();
+}
+function drawBear(t){
+  o(4);const sway=Math.sin(t*3)*2;
+  cx.fillStyle="#7a4b28";
+  // haunches + body
+  cx.beginPath();cx.ellipse(0,-40+sway,32,34,0,0,7);cx.fill();cx.stroke();
+  cx.beginPath();cx.ellipse(-4,-16,30,16,0,0,7);cx.fill();cx.stroke();
+  // head
+  cx.beginPath();cx.arc(24,-66+sway,16,0,7);cx.fill();cx.stroke();
+  cx.fillStyle="#a5764b";cx.beginPath();cx.ellipse(32,-62+sway,8,6,0,0,7);cx.fill();
+  cx.fillStyle=INK;cx.beginPath();cx.arc(36,-63+sway,2,0,7);cx.fill();
+  cx.beginPath();cx.arc(26,-70+sway,2,0,7);cx.fill();
+  // ears
+  cx.fillStyle="#7a4b28";cx.beginPath();cx.arc(16,-80+sway,6,0,7);cx.arc(32,-80+sway,6,0,7);cx.fill();cx.stroke();
+  // paw
+  cx.strokeStyle=INK;cx.lineWidth=6;cx.beginPath();cx.moveTo(-20,-8);cx.lineTo(-24,0);cx.moveTo(16,-8);cx.lineTo(18,0);cx.stroke();
+}
+function drawRabbit(t){
+  o(3);const hop=Math.abs(Math.sin(t*7))*8;
+  cx.fillStyle="#d8dee8";
+  cx.beginPath();cx.ellipse(0,-14-hop,14,11,0,0,7);cx.fill();cx.stroke();
+  cx.beginPath();cx.arc(12,-24-hop,7,0,7);cx.fill();cx.stroke();
+  // ears
+  cx.beginPath();cx.ellipse(9,-38-hop,3,9,-0.2,0,7);cx.fill();cx.stroke();
+  cx.beginPath();cx.ellipse(16,-38-hop,3,9,0.2,0,7);cx.fill();cx.stroke();
+  cx.fillStyle="#fff";cx.beginPath();cx.arc(-12,-12-hop,4,0,7);cx.fill();
+  cx.fillStyle=INK;cx.beginPath();cx.arc(15,-25-hop,1.4,0,7);cx.fill();
+}
+function drawStump(){
+  o(3.5);cx.fillStyle="#8a5a33";
+  cx.fillRect(-20,-36,40,36);cx.strokeRect(-20,-36,40,36);
+  cx.fillStyle="#c99a67";cx.beginPath();cx.ellipse(0,-36,20,7,0,0,7);cx.fill();cx.stroke();
+  cx.strokeStyle="#8a5a33";cx.lineWidth=2;
+  cx.beginPath();cx.ellipse(0,-36,12,4,0,0,7);cx.stroke();
+  cx.beginPath();cx.ellipse(0,-36,5,2,0,0,7);cx.stroke();
+  cx.fillStyle="#fff";cx.beginPath();cx.ellipse(0,-40,21,5,0,0,7);cx.fill(); // snow cap
+}
+function drawWater(t){
+  o(3.5);
+  cx.fillStyle="#3d86c9";
+  cx.beginPath();cx.ellipse(0,0,55,10,0,0,7);cx.fill();cx.stroke();
+  cx.strokeStyle="rgba(255,255,255,.8)";cx.lineWidth=2.5;
+  for(let i=0;i<3;i++){
+    const ph=t*3+i*2;
+    cx.beginPath();cx.moveTo(-34+i*24,Math.sin(ph)*1.5-2);
+    cx.quadraticCurveTo(-26+i*24,Math.sin(ph)*1.5-5,-18+i*24,Math.sin(ph)*1.5-2);cx.stroke();
+  }
+}
+
+/* ----- the sled (modeled on a vintage yellow snowmobile) ----- */
+function drawSled(t){
+  const x=player.x, y=player.y;
+  cx.save();cx.translate(x,y);cx.rotate(-player.lean*0.5);
+  const vib=player.grounded?Math.sin(t*60)*1.1:0;
+  cx.translate(0,vib);
+
+  // boost flame
+  if(player.boosting>0){
+    cx.save();cx.translate(-70,-12);
+    const fl=1+Math.sin(t*40)*0.25;
+    cx.fillStyle="#ff9430";
+    cx.beginPath();cx.moveTo(0,-8);cx.quadraticCurveTo(-36*fl,0,0,8);cx.closePath();cx.fill();
+    cx.fillStyle="#ffd94a";
+    cx.beginPath();cx.moveTo(0,-5);cx.quadraticCurveTo(-22*fl,0,0,5);cx.closePath();cx.fill();
+    cx.restore();
+  }
+
+  // rear track (black, with cartoon lugs)
+  o(3.5);
+  cx.fillStyle="#2a2f38";
+  cx.beginPath();cx.roundRect(-62,-16,74,22,10);cx.fill();cx.stroke();
+  cx.fillStyle="#454c59";
+  for(let i=0;i<6;i++){
+    const ph=((player.trackPhase+i*12)%72)-60;
+    cx.fillRect(-60+((ph+60)%72),1,6,5);
+  }
+  // rear bumper handle (chrome loop like the photo)
+  cx.strokeStyle="#c9d4de";cx.lineWidth=5;
+  cx.beginPath();cx.moveTo(-60,-18);cx.quadraticCurveTo(-74,-22,-72,-34);cx.stroke();
+  o(2);cx.beginPath();cx.moveTo(-60,-18);cx.quadraticCurveTo(-74,-22,-72,-34);cx.stroke();
+
+  // --- body: long yellow tunnel rising into rounded nose cone ---
+  const bodyG=cx.createLinearGradient(0,-70,0,-6);
+  bodyG.addColorStop(0,"#ffe14d");bodyG.addColorStop(0.6,"#f9c60e");bodyG.addColorStop(1,"#e0a900");
+  cx.fillStyle=bodyG;o(4);
+  cx.beginPath();
+  cx.moveTo(-64,-14);                       // tail
+  cx.lineTo(-64,-26);
+  cx.lineTo(6,-30);                         // seat deck
+  cx.quadraticCurveTo(26,-32,34,-58);       // rise to console
+  cx.quadraticCurveTo(40,-72,58,-70);       // top of nose
+  cx.quadraticCurveTo(78,-66,82,-44);       // rounded bonnet front
+  cx.quadraticCurveTo(84,-26,74,-18);       // drop to bumper
+  cx.lineTo(-64,-14);
+  cx.closePath();cx.fill();cx.stroke();
+
+  // black side stripe with ski-doo script
+  cx.fillStyle="#22262e";
+  cx.beginPath();
+  cx.moveTo(-58,-16);cx.lineTo(70,-20);
+  cx.quadraticCurveTo(80,-24,80,-34);
+  cx.lineTo(78,-38);cx.lineTo(-58,-24);cx.closePath();cx.fill();
+
+  // chrome trim under stripe
+  cx.strokeStyle="#d7e1ea";cx.lineWidth=3;
+  cx.beginPath();cx.moveTo(-58,-15);cx.lineTo(72,-18);cx.stroke();
+
+  // tufted black seat
+  cx.fillStyle="#20242c";o(3.5);
+  cx.beginPath();cx.roundRect(-58,-40,62,14,6);cx.fill();cx.stroke();
+  cx.strokeStyle="#3c434f";cx.lineWidth=2;
+  for(let i=1;i<5;i++){cx.beginPath();cx.moveTo(-58+i*12,-40);cx.lineTo(-58+i*12,-27);cx.stroke();}
+
+  // headlight
+  cx.fillStyle="#fff6cf";o(3);
+  cx.beginPath();cx.ellipse(76,-52,6,8,0,0,7);cx.fill();cx.stroke();
+
+  /* ----- rider: 1970s racer, crouched like the reference photo ----- */
+  const SUIT="#5b2e38", SUIT_D="#472129";
+  const crouch=player.grounded?0:-6;              // stands taller off jumps
+  // hair streaming from under the helmet
+  cx.fillStyle="#c98d4b";o(2.5);
+  cx.beginPath();
+  cx.moveTo(2,-100+crouch);
+  cx.quadraticCurveTo(-18,-102+crouch+Math.sin(t*9)*3,-30,-92+crouch+Math.sin(t*7)*4);
+  cx.quadraticCurveTo(-16,-92+crouch,-2,-92+crouch);
+  cx.closePath();cx.fill();cx.stroke();
+  // rear leg (shaded)
+  cx.strokeStyle=SUIT_D;cx.lineWidth=9;cx.lineCap="round";
+  cx.beginPath();cx.moveTo(-32,-58+crouch);cx.lineTo(-16,-42);cx.lineTo(-26,-22);cx.stroke();
+  // front leg
+  cx.strokeStyle=SUIT;cx.lineWidth=9;
+  cx.beginPath();cx.moveTo(-30,-58+crouch);cx.lineTo(-2,-44);cx.lineTo(-12,-22);cx.stroke();
+  // boots
+  cx.fillStyle="#c9a76a";o(3);
+  cx.beginPath();cx.roundRect(-34,-26,16,12,4);cx.fill();cx.stroke();
+  cx.beginPath();cx.roundRect(-20,-26,16,12,4);cx.fill();cx.stroke();
+  // torso leaning into the wind
+  cx.fillStyle=SUIT;o(3.5);
+  cx.beginPath();
+  cx.moveTo(-38,-52+crouch);
+  cx.quadraticCurveTo(-40,-70+crouch,-24,-82+crouch);
+  cx.lineTo(6,-96+crouch);
+  cx.quadraticCurveTo(14,-84+crouch,6,-72+crouch);
+  cx.lineTo(-24,-52+crouch);
+  cx.closePath();cx.fill();cx.stroke();
+  // white racing bib + number
+  cx.fillStyle="#f2f2ee";
+  cx.beginPath();
+  cx.moveTo(-6,-88+crouch);cx.lineTo(6,-93+crouch);
+  cx.quadraticCurveTo(12,-84+crouch,5,-73+crouch);cx.lineTo(-7,-70+crouch);
+  cx.closePath();cx.fill();
+  cx.fillStyle=SUIT_D;cx.font="bold 11px Trebuchet MS";cx.textAlign="center";
+  cx.save();cx.translate(0,-80+crouch);cx.rotate(-0.25);cx.fillText("7",0,4);cx.restore();
+  // arm reaching the bars
+  cx.strokeStyle=SUIT;cx.lineWidth=8;
+  cx.beginPath();cx.moveTo(0,-88+crouch);cx.lineTo(16,-80+crouch*0.5);cx.lineTo(29,-71);cx.stroke();
+  // glove
+  cx.fillStyle="#22262e";o(2.5);
+  cx.beginPath();cx.arc(30,-70,5,0,7);cx.fill();cx.stroke();
+  // helmet
+  cx.fillStyle="#f5f6f8";o(3.5);
+  cx.beginPath();cx.arc(9,-104+crouch,13,0,7);cx.fill();cx.stroke();
+  // visor
+  cx.fillStyle="rgba(120,160,200,.85)";
+  cx.beginPath();
+  cx.moveTo(13,-112+crouch);cx.quadraticCurveTo(24,-108+crouch,22,-98+crouch);
+  cx.quadraticCurveTo(14,-96+crouch,10,-100+crouch);cx.closePath();cx.fill();cx.stroke();
+  // helmet chin strap
+  cx.strokeStyle=INK;cx.lineWidth=2;
+  cx.beginPath();cx.moveTo(4,-93+crouch);cx.lineTo(12,-92+crouch);cx.stroke();
+
+  // windshield
+  cx.fillStyle="rgba(215,240,255,.55)";o(3);
+  cx.beginPath();
+  cx.moveTo(36,-58);cx.quadraticCurveTo(44,-96,64,-92);
+  cx.quadraticCurveTo(60,-72,56,-66);cx.closePath();cx.fill();cx.stroke();
+
+  // handlebar
+  cx.strokeStyle=INK;cx.lineWidth=4;
+  cx.beginPath();cx.moveTo(40,-60);cx.lineTo(31,-69);cx.stroke();
+
+  // front ski (yellow with leaf spring, like the photo)
+  cx.save();cx.translate(66,0);cx.rotate(player.grounded?0:-player.lean*0.4);
+  cx.strokeStyle=INK;cx.lineWidth=4;
+  cx.beginPath();cx.moveTo(0,-16);cx.lineTo(0,2);cx.stroke();      // strut
+  cx.strokeStyle="#8f9aa8";cx.lineWidth=3;
+  cx.beginPath();cx.moveTo(-10,2);cx.quadraticCurveTo(0,-6,10,2);cx.stroke(); // leaf spring
+  cx.fillStyle="#f9c60e";o(3.5);
+  cx.beginPath();
+  cx.moveTo(-22,6);cx.lineTo(26,6);cx.quadraticCurveTo(40,4,42,-8);
+  cx.quadraticCurveTo(34,0,24,1);cx.lineTo(-22,1);cx.closePath();cx.fill();cx.stroke();
+  cx.restore();
+
+  // spray when grounded
+  if(player.grounded&&player.speed>100){
+    cx.fillStyle="rgba(255,255,255,.85)";
+    for(let i=0;i<5;i++){
+      const px=-64-Math.random()*26, py=2-Math.random()*14;
+      cx.beginPath();cx.arc(px,py,2+Math.random()*3,0,7);cx.fill();
+    }
+  }
+  // splash rings if in water
+  if(player.splash>0){
+    cx.strokeStyle="rgba(80,150,220,.8)";cx.lineWidth=3;
+    cx.beginPath();cx.ellipse(0,4,40*(1.2-player.splash),8,0,0,7);cx.stroke();
+  }
+  cx.restore();
+}
+
+/* ----- popups, HUD ----- */
+function drawPopups(){
+  cx.font="bold 20px Trebuchet MS";cx.textAlign="center";
+  for(const p of airPopups){
+    cx.globalAlpha=clamp(p.t,0,1);
+    cx.fillStyle=INK;cx.fillText(p.txt,p.x+2,p.y+2);
+    cx.fillStyle="#f9c60e";cx.fillText(p.txt,p.x,p.y);
+    cx.globalAlpha=1;
+  }
+}
+function panel(x,y,w,h){
+  cx.fillStyle="rgba(29,42,58,.82)";
+  cx.beginPath();cx.roundRect(x,y,w,h,12);cx.fill();
+  cx.strokeStyle="rgba(255,255,255,.25)";cx.lineWidth=2;cx.stroke();
+}
+function drawHUD(){
+  // timer
+  panel(16,14,150,52);
+  cx.fillStyle=timer<8?"#ff6a5e":"#fff";cx.font="bold 30px Trebuchet MS";cx.textAlign="left";
+  cx.fillText(timer.toFixed(1),34,51);
+  cx.fillStyle="#9fb8d4";cx.font="bold 11px Trebuchet MS";cx.fillText("TIME",34,26);
+  // score
+  panel(W-206,14,190,52);
+  cx.fillStyle="#ffd94a";cx.font="bold 26px Trebuchet MS";cx.textAlign="right";
+  cx.fillText(score.toLocaleString(),W-34,50);
+  cx.fillStyle="#9fb8d4";cx.font="bold 11px Trebuchet MS";cx.fillText("SCORE",W-34,26);
+  // level + progress bar
+  panel(W/2-140,14,280,52);
+  cx.fillStyle="#fff";cx.font="bold 14px Trebuchet MS";cx.textAlign="center";
+  cx.fillText("LEVEL "+level+" / "+MAX_LEVEL,W/2,32);
+  const pr=clamp((player.x+camX)/cabinX,0,1);
+  cx.fillStyle="rgba(255,255,255,.2)";cx.beginPath();cx.roundRect(W/2-110,40,220,12,6);cx.fill();
+  cx.fillStyle="#f9c60e";cx.beginPath();cx.roundRect(W/2-110,40,220*pr,12,6);cx.fill();
+  cx.fillStyle="#7c4a26";cx.font="bold 12px Trebuchet MS";
+  cx.fillText("🏠",W/2-110+220*pr,38);
+  // boost fuel bar
+  panel(16,H-46,220,32);
+  cx.fillStyle="#9fb8d4";cx.font="bold 11px Trebuchet MS";cx.textAlign="left";
+  cx.fillText("BOOST [B]",28,H-25);
+  cx.fillStyle="rgba(255,255,255,.15)";
+  cx.beginPath();cx.roundRect(104,H-38,116,16,6);cx.fill();
+  const ff=player.boostFuel/player.maxFuel;
+  cx.fillStyle=player.boosting?"#ffd94a":"#ff9430";
+  cx.beginPath();cx.roundRect(104,H-38,116*ff,16,6);cx.fill();
+}
+
+/* ----- snow ----- */
+function drawSnowfall(){
+  cx.fillStyle="rgba(255,255,255,.9)";
+  for(const f of flakes){cx.beginPath();cx.arc(f.x,f.y,f.r,0,7);cx.fill();}
+}
+
+/* ----- screens ----- */
+function dim(a){cx.fillStyle="rgba(14,26,40,"+a+")";cx.fillRect(0,0,W,H);}
+function bigTitle(txt,y,size,col){
+  cx.textAlign="center";cx.font="bold "+size+"px Trebuchet MS";
+  cx.fillStyle=INK;cx.fillText(txt,W/2+4,y+4);
+  cx.fillStyle=col;cx.fillText(txt,W/2,y);
+}
+function drawOverlays(t){
+  cx.textAlign="center";
+  if(state===ST.TITLE){
+    dim(0.35);
+    // hero sled on title
+    player.x=W/2; player.y=GROUND_Y-40+Math.sin(t*2)*6; player.lean=0.15;
+    drawSled(t); player.x=180;
+    bigTitle("IRONWOOD RUN",150,64,"#f9c60e");
+    cx.font="bold 18px Trebuchet MS";cx.fillStyle="#ffffff";
+    cx.fillText("By: Andrew Gille",W/2,178);
+    cx.font="bold 20px Trebuchet MS";cx.fillStyle="#fff";
+    cx.fillText("Race the clock to the cabin!",W/2,205);
+    cx.font="16px Trebuchet MS";cx.fillStyle="#cfe4f4";
+    cx.fillText("SPACE — jump over deer, skunks, bears, rabbits, stumps & open water",W/2,H-152);
+    cx.fillText("HOLD B — boost (fuel shrinks each level) · grab ⚡ cans for extra fuel",W/2,H-128);
+    cx.fillText("Hit ramps fast to fly farther · run into a rare YETI for a super throw!",W/2,H-104);
+    cx.font="bold 22px Trebuchet MS";cx.fillStyle="#ffd94a";
+    if(Math.sin(t*4)>-0.3)cx.fillText("PRESS ENTER TO START",W/2,H-64);
+    cx.font="14px Trebuchet MS";cx.fillStyle="#9fb8d4";
+    cx.fillText("H — Hall of Fame",W/2,H-36);
+  }
+  else if(state===ST.LEVELDONE){
+    dim(0.55);
+    bigTitle("LEVEL "+level+" CLEAR!",190,52,"#f9c60e");
+    cx.font="bold 22px Trebuchet MS";cx.fillStyle="#fff";
+    cx.fillText("You made it to the cabin with "+timer.toFixed(1)+"s to spare",W/2,240);
+    cx.fillText("Time bonus +"+Math.round(timer*50)+"   ·   Level bonus +"+(level*100),W/2,274);
+    if(player.bestAir>0)cx.fillText("Longest jump: "+player.bestAir+" ft",W/2,308);
+    cx.fillStyle="#ffd94a";cx.font="bold 20px Trebuchet MS";
+    if(Math.sin(t*4)>-0.3)cx.fillText("ENTER — Level "+(level+1)+" (it gets harder…)",W/2,H-90);
+  }
+  else if(state===ST.GAMEOVER){
+    dim(0.6);
+    bigTitle("OUT OF TIME!",200,56,"#ff6a5e");
+    cx.font="bold 24px Trebuchet MS";cx.fillStyle="#fff";
+    cx.fillText("Final score: "+score.toLocaleString(),W/2,256);
+    cx.font="bold 20px Trebuchet MS";cx.fillStyle="#ffd94a";
+    if(Math.sin(t*4)>-0.3)cx.fillText("PRESS ENTER",W/2,H-90);
+  }
+  else if(state===ST.WIN){
+    dim(0.55);
+    bigTitle("YOU CONQUERED ALL 5 LEVELS!",180,42,"#f9c60e");
+    cx.font="bold 26px Trebuchet MS";cx.fillStyle="#fff";
+    cx.fillText("Champion of the trail 🏆",W/2,232);
+    cx.fillText("Final score: "+score.toLocaleString(),W/2,270);
+    cx.font="bold 20px Trebuchet MS";cx.fillStyle="#ffd94a";
+    if(Math.sin(t*4)>-0.3)cx.fillText("PRESS ENTER",W/2,H-90);
+  }
+  else if(state===ST.INITIALS){
+    dim(0.7);
+    bigTitle("HALL OF FAME!",150,48,"#f9c60e");
+    cx.font="bold 20px Trebuchet MS";cx.fillStyle="#fff";
+    cx.fillText("New high score: "+score.toLocaleString()+" — enter your initials",W/2,196);
+    for(let i=0;i<3;i++){
+      const x=W/2-80+i*80;
+      cx.fillStyle=i===initialSlot?"rgba(249,198,14,.25)":"rgba(255,255,255,.08)";
+      cx.beginPath();cx.roundRect(x-28,236,56,72,10);cx.fill();
+      cx.strokeStyle=i===initialSlot?"#f9c60e":"rgba(255,255,255,.3)";cx.lineWidth=3;cx.stroke();
+      cx.fillStyle="#fff";cx.font="bold 46px Trebuchet MS";
+      cx.fillText(initials[i],x,290);
+      if(i===initialSlot&&Math.sin(t*6)>0){cx.fillStyle="#f9c60e";cx.fillRect(x-20,300,40,4);}
+    }
+    cx.font="15px Trebuchet MS";cx.fillStyle="#cfe4f4";
+    cx.fillText("Type letters · arrows to move / cycle · ENTER to confirm",W/2,352);
+  }
+  else if(state===ST.FAME){
+    dim(0.7);
+    bigTitle("HALL OF FAME",120,50,"#f9c60e");
+    cx.font="bold 24px monospace";
+    for(let i=0;i<hallOfFame.length;i++){
+      const e=hallOfFame[i], y=190+i*52;
+      const isNew=(pendingFameRank===i);
+      cx.fillStyle=isNew?"#ffd94a":"#fff";
+      cx.textAlign="left";cx.fillText((i+1)+".  "+e.n,W/2-170,y);
+      cx.textAlign="right";cx.fillText(e.s.toLocaleString(),W/2+170,y);
+      if(isNew){cx.textAlign="left";cx.fillStyle="#ff9430";cx.font="bold 16px Trebuchet MS";
+        cx.fillText("★ NEW",W/2+190,y);cx.font="bold 24px monospace";}
+    }
+    cx.textAlign="center";
+    cx.font="bold 20px Trebuchet MS";cx.fillStyle="#ffd94a";
+    if(Math.sin(t*4)>-0.3)cx.fillText("ENTER — back to title",W/2,H-70);
+  }
+}
+
+buildLevel(1);          // scenery for title screen
+state=ST.TITLE;
+requestAnimationFrame(tick);
+</script>
+</body>
+</html>
